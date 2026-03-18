@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.env
+
+# Type checking / linting
+.mypy_cache/
+.ruff_cache/
+.bandit
+
+# Test / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Compiled test programs (repo root)
+test_prog
+test_prog_*
+
+# Optimized source output
+optimized/
+
+# perf artifacts
+perf.data
+perf.data.old
+/tmp/perf_agent_*/
+/tmp/perf_opt_*/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

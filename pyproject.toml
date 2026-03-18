@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "perf-agent"
+version = "0.1.0"
+description = "AI-powered Linux perf profiler CLI"
+requires-python = ">=3.11"
+dependencies = [
+    "rich>=13.0,<14",
+    "requests>=2.28,<3",
+    "openai>=1.0,<2",
+    "anthropic>=0.44,<1",
+    "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "bandit[toml]>=1.7",
+    "pip-audit>=2.6",
+    "mypy>=1.8",
+]
+
+[project.scripts]
+perf-agent = "perf_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["perf_agent*"]
+
+[tool.setuptools.package-data]
+perf_agent = ["prompts/*.json"]

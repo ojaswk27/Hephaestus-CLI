@@ -1,0 +1,9 @@
+FROM --platform=linux/arm64/v8 ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc-13 linux-tools-common linux-tools-generic \
+    && rm -rf /var/lib/apt/lists/*
+RUN PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1) && \
+    [ -n "$PERF" ] && ln -sf "$PERF" /usr/local/bin/perf || true
+WORKDIR /work
+CMD ["sleep", "infinity"]

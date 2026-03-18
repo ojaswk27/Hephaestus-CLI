@@ -1,0 +1,22 @@
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    software-properties-common \
+    && wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc \
+    && echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-17 main" \
+       > /etc/apt/sources.list.d/llvm-17.list \
+    && apt-get update && apt-get install -y \
+    clang-17 \
+    lld-17 \
+    linux-tools-common \
+    linux-tools-generic \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1) && \
+    ln -sf "$PERF" /usr/local/bin/perf
+
+WORKDIR /work
+CMD ["sleep", "infinity"]
