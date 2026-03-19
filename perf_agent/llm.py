@@ -234,6 +234,8 @@ def build_optimize_user_message(
     max_iterations: int,
     lang: "LanguageSpec",
     provider: str = "openai",
+    repo_context: "dict[str, str] | None" = None,
+    dep_tree: "str | None" = None,
 ) -> str:
     def _fmt_int(v: int | None) -> str:
         return f"{v:,}" if v is not None else "N/A"
@@ -276,6 +278,44 @@ def build_optimize_user_message(
     prompts = _load_prompts(provider)
     source_label = prompts.get("optimize_user_source_label", "=== Current Source Code ===")
 
+    # Build optional repo-context block
+    repo_block = ""
+    if repo_context is not None and dep_tree is not None:
+        tmpl = prompts.get("optimize_user_repo_context", "")
+        if tmpl:
+            deps_lines: list[str] = []
+            dependents_lines: list[str] = []
+            # repo_context keys use a two-tuple convention: ("dep", rel_path) or ("dependent", rel_path)
+            for key, header in repo_context.items():
+                kind, rel = key
+                if kind == "dep":
+                    deps_lines.append(f"#### {rel}\n```{lang.fence}\n{header}\n```")
+                else:
+                    dependents_lines.append(f"#### {rel}\n```{lang.fence}\n{header}\n```")
+            if provider == "anthropic":
+                deps_section = (
+                    "<files_this_module_imports>\n" + "\n\n".join(deps_lines) + "\n</files_this_module_imports>"
+                    if deps_lines else "<files_this_module_imports>(none)</files_this_module_imports>"
+                )
+                dependents_section = (
+                    "<files_that_import_this_module>\n" + "\n\n".join(dependents_lines) + "\n</files_that_import_this_module>"
+                    if dependents_lines else "<files_that_import_this_module>(none)</files_that_import_this_module>"
+                )
+            else:
+                deps_section = (
+                    "**Files this module depends on** (do not break their interfaces):\n\n" + "\n\n".join(deps_lines)
+                    if deps_lines else "**Files this module depends on:** (none)"
+                )
+                dependents_section = (
+                    "**Files that depend on this module** (your exported API must stay stable):\n\n" + "\n\n".join(dependents_lines)
+                    if dependents_lines else "**Files that depend on this module:** (none)"
+                )
+            repo_block = "\n" + tmpl.format(
+                dep_tree=dep_tree,
+                deps_section=deps_section,
+                dependents_section=dependents_section,
+            ) + "\n"
+
     return f"""\
 === OPTIMIZATION REQUEST — Iteration {iteration}/{max_iterations} ===
 Binary: {binary} | elapsed: {_fmt_float(metrics.elapsed_seconds)}s | IPC: {_fmt_float(metrics.ipc)} | Cache miss: {_fmt_float(metrics.cache_miss_pct, 1)}%
@@ -292,7 +332,7 @@ Cache references: {_fmt_int(metrics.cache_references)} ({_fmt_float(metrics.cach
 
 === Optimization History ===
 {history_block}
-
+{repo_block}
 {source_label}
 ```{lang.fence}
 {source_block}
@@ -320,11 +360,14 @@ def _collect_optimization_openai(
     api_key: str | None,
     think: bool,
     target_context: str | None,
+    repo_context: "dict | None" = None,
+    dep_tree: "str | None" = None,
 ) -> tuple[str, str, str]:
     system_content = _make_optimize_system(lang, "openai", target_context)
     user_content = build_optimize_user_message(
         binary, current_source, metrics, functions,
         history, iteration, max_iterations, lang, provider="openai",
+        repo_context=repo_context, dep_tree=dep_tree,
     )
     messages = [
         {"role": "system", "content": system_content},
@@ -363,6 +406,8 @@ def _collect_optimization_anthropic(
     api_key: str | None,
     think: bool,
     target_context: str | None,
+    repo_context: "dict | None" = None,
+    dep_tree: "str | None" = None,
 ) -> tuple[str, str, str]:
     try:
         import anthropic as _anthropic
@@ -373,6 +418,7 @@ def _collect_optimization_anthropic(
     user_content = build_optimize_user_message(
         binary, current_source, metrics, functions,
         history, iteration, max_iterations, lang, provider="anthropic",
+        repo_context=repo_context, dep_tree=dep_tree,
     )
     thinking_config, max_tokens = _anthropic_thinking_params(model, think)
 
@@ -423,17 +469,100 @@ def collect_optimization(
     api_key: str | None = None,
     think: bool = True,
     target_context: str | None = None,
+    repo_context: "dict | None" = None,
+    dep_tree: "str | None" = None,
 ) -> tuple[str, str, str]:
     """Request one optimization from the LLM. Returns (thinking_text, response_text, change_summary)."""
     if detect_provider(model) == "anthropic":
         return _collect_optimization_anthropic(
             current_source, metrics, functions, binary, history,
             iteration, max_iterations, lang, model, base_url, api_key, think, target_context,
+            repo_context=repo_context, dep_tree=dep_tree,
         )
     return _collect_optimization_openai(
         current_source, metrics, functions, binary, history,
         iteration, max_iterations, lang, model, base_url, api_key, think, target_context,
+        repo_context=repo_context, dep_tree=dep_tree,
     )
+
+
+# ---------------------------------------------------------------------------
+# build_dependency_tree
+# ---------------------------------------------------------------------------
+
+def build_dependency_tree(
+    repo_context: dict[str, str],
+    lang: "LanguageSpec",
+    model: str,
+    base_url: str | None,
+    api_key: str | None,
+) -> str:
+    """Ask the LLM to return a plain-text dependency tree from import headers.
+
+    Returns a multi-line string like:
+        main.py
+        ├── utils.py
+        │   └── constants.py
+        └── sort.py
+    """
+    provider = detect_provider(model)
+
+    headers_text = "\n\n".join(
+        f"### {path}\n```{lang.fence}\n{header}\n```"
+        for path, header in repo_context.items()
+    )
+
+    if provider == "anthropic":
+        system_prompt = (
+            f"You are a dependency analyser. Given import headers from a {lang.display_name} project, "
+            "output a dependency tree. Do not guess — only use what the import lines tell you. "
+            "Output plain text only, using tree characters (├── └── │). "
+            "List the entry point(s) at the top level."
+        )
+    else:
+        system_prompt = (
+            f"You are a dependency analyser. Given import headers from a {lang.display_name} project, "
+            "output a dependency tree. Do not guess — only use what the import lines tell you. "
+            "Output plain text only, using tree characters (├── └── │). "
+            "List the entry point(s) at the top level."
+        )
+
+    user_message = f"Here are the import headers for all files in the project:\n\n{headers_text}"
+
+    if provider == "anthropic":
+        try:
+            import anthropic as _anthropic
+        except ImportError as e:
+            raise LLMConnectionError("anthropic package not installed. Run: pip install anthropic") from e
+        client = _make_anthropic_client(api_key, base_url)
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=2048,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_message}],
+            )
+            return "\n".join(b.text for b in response.content if b.type == "text")
+        except Exception as exc:
+            raise _anthropic_error_map(exc) from exc
+    else:
+        client = _make_openai_client(api_key, base_url)
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                stream=False,
+            )
+            return response.choices[0].message.content or ""
+        except _openai.AuthenticationError as e:
+            raise LLMConnectionError("Invalid OpenAI API key.") from e
+        except _openai.APIConnectionError as e:
+            raise LLMConnectionError(f"Cannot connect to LLM API: {e}") from e
+        except _openai.NotFoundError as e:
+            raise LLMModelNotFoundError(f"Model '{model}' not found.") from e
 
 
 # ---------------------------------------------------------------------------

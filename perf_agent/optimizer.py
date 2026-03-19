@@ -150,6 +150,8 @@ class OptimizeConfig:
         default_factory=lambda: lambda score: None
     )
     api_key: Optional[str] = None
+    repo_context: Optional[dict] = None   # {("dep"|"dependent", rel_path): header} for LLM context
+    dep_tree: Optional[str] = None        # plain-text dependency tree from build_dependency_tree()
     security_fn: Optional[Callable] = None
     on_security_result: Optional[Callable] = None
     # Security remediation pre-pass: ask LLM to fix issues before optimising
@@ -307,6 +309,8 @@ def run_optimize_loop(config: OptimizeConfig) -> tuple[list[IterationRecord], Pa
                     api_key=config.api_key,
                     think=config.think,
                     target_context=config.target_context,
+                    repo_context=config.repo_context,
+                    dep_tree=config.dep_tree,
                 )
             config.on_llm_response(thinking_text, response_text, iteration)
 

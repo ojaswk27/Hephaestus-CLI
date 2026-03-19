@@ -9,6 +9,7 @@ An AI-powered Linux `perf` profiler that profiles your code, explains bottleneck
 3. **Optimize loop** — proposes one change per iteration, compiles, re-profiles, keeps or reverts based on measured elapsed time
 4. **Security gate** — every LLM-generated candidate is scanned before it is accepted (regex → cppcheck → ASan/UBSan → LLM audit)
 5. **Correctness gate** — candidate output is compared against the original; pytest / `go test` used automatically when present
+6. **Repo-aware mode** (`--repo`) — scans all source files, builds a dependency tree via the LLM, then optimizes each hot file with full awareness of what it imports and what imports it — preventing broken cross-file interfaces
 
 ## Install
 
@@ -40,6 +41,10 @@ perf-agent my_program
 
 # Optimize a C file for 5 iterations
 perf-agent --loops 5 --source prog.c prog.c
+
+# Repo-aware optimization: scan an entire project, build a dep tree,
+# optimize each hot file with cross-file interface awareness
+perf-agent --repo ./myproject --source ./myproject/main.py --loops 3 main.py
 ```
 
 ## Languages
@@ -115,6 +120,35 @@ sudo apt install qemu-user-static  # Debian/Ubuntu
 docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 ```
 
+## Repo-aware optimization
+
+Pass `--repo` to optimize an entire project while preserving cross-file interfaces:
+
+```bash
+perf-agent \
+    --repo ./myproject \
+    --source ./myproject/main.py \
+    --loops 5 \
+    --model claude-sonnet-4-6 \
+    ./myproject/main.py
+```
+
+**What happens:**
+
+1. All source files matching the detected language are scanned under `--repo`
+2. The first 50 lines of each file (where imports live) are extracted
+3. The LLM analyses the import headers and produces a dependency tree
+4. The entry point (`--source`) is profiled with `perf`
+5. Files are ranked by hotness — hot files are optimized first
+6. Each file's optimization prompt includes:
+   - The full dependency tree
+   - Import headers of files it depends on (so the LLM knows their API)
+   - Import headers of files that depend on it (so the LLM keeps its API stable)
+   - An explicit constraint: *do not change exported signatures*
+7. Each file runs the full `--loops` optimization loop with all security and correctness gates
+
+This prevents the LLM from breaking cross-file interfaces while still applying real per-file performance improvements.
+
 ## Security features
 
 Every LLM-generated candidate passes through a multilayer gate before being compiled or profiled:
@@ -138,6 +172,7 @@ The original source is also scanned before the loop begins; the LLM is asked to 
 | `--lang LANG` | auto | `c` `cpp` `rust` `go` `java` `javascript` `python` |
 | `--compiler CMD` | language default | Compiler override |
 | `--compile-flags FLAGS` | language default | Compiler flags override |
+| `--repo DIR` | — | Project root for repo-aware multi-file optimization (requires `--source` and `--loops`) |
 | `--output-dir DIR` | `optimized/` | Where to write the best source |
 | `--model NAME` | `gpt-4o` | LLM model name |
 | `--base-url URL` | — | OpenAI-compatible API base URL |

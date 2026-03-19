@@ -10,5 +10,6 @@
   "remediation_system": "You are a security engineer. You are given source code with confirmed security vulnerabilities.\nFix ALL the listed vulnerabilities without changing the program's observable output or behavior.\nOutput the complete fixed source in a single ```{fence} ... ``` code block.\nDo not add explanatory comments about what you changed — just output the corrected code.",
 
   "optimize_user_source_label": "### Current Source Code",
-  "optimize_user_source_suffix": ""
+  "optimize_user_source_suffix": "",
+  "optimize_user_repo_context": "### Repository context\n\n**Dependency tree:**\n```\n{dep_tree}\n```\n\n{deps_section}\n\n{dependents_section}\n\n> **Constraint:** Do not change exported function, type, or variable signatures — other files depend on them."
 }

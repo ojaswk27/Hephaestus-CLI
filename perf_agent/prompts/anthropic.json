@@ -10,5 +10,6 @@
   "remediation_system": "<role>\nYou are a security engineer auditing {display_name} code.\n</role>\n\n<instructions>\nFix ALL listed security vulnerabilities without changing the program's observable output or behavior.\nOutput the complete fixed source in a single ```{fence}\\n...\\n``` code block.\nDo not add comments explaining what you changed — only output the corrected code.\n</instructions>",
 
   "optimize_user_source_label": "Current source (<do_not_truncate>output the full file in your code block</do_not_truncate>):",
-  "optimize_user_source_suffix": ""
+  "optimize_user_source_suffix": "",
+  "optimize_user_repo_context": "<repository_context>\n<dependency_tree>\n{dep_tree}\n</dependency_tree>\n\n<deps_section>\n{deps_section}\n</deps_section>\n\n<dependents_section>\n{dependents_section}\n</dependents_section>\n\n<constraint>Do not change exported function, type, or variable signatures — other files depend on them.</constraint>\n</repository_context>"
 }

@@ -27,6 +27,7 @@ from .errors import (
     PerfTimeoutError,
 )
 from .languages import LANGUAGES, LanguageSpec, detect_language, get_language
+from .repo import scan_repo, build_repo_context
 
 _FORBIDDEN_FLAGS = {"-o", "--output", "-MF", "-MT", "-MQ", "-save-temps"}
 
@@ -122,6 +123,10 @@ def _build_parser() -> argparse.ArgumentParser:
     opt_group.add_argument("--output-dir", type=Path, default=None, metavar="DIR",
                            help="Directory to write optimized source "
                                 "(default: optimized/ next to source)")
+    opt_group.add_argument("--repo", type=Path, default=None, metavar="DIR",
+                           help="Root directory of the project to optimize. Scans all source "
+                                "files, builds a dependency tree, then optimizes each file in "
+                                "hot-function order. Requires --source (entry point) and --loops.")
 
     docker_group = p.add_argument_group("docker targets")
     docker_group.add_argument("--target", default=None, metavar="NAME",
@@ -295,6 +300,8 @@ def main() -> None:
     try:
         if ns.target is not None:
             _run_docker_path(p, ns, binary_args)
+        elif getattr(ns, "repo", None) is not None:
+            _run_repo_path(p, ns, binary_args)
         else:
             _run_local_path(p, ns, binary_args)
 
@@ -542,6 +549,241 @@ def _run_local_path(p: argparse.ArgumentParser, ns: argparse.Namespace, binary_a
         shutil.rmtree(tmpdir, ignore_errors=True)
         if work_tmpdir is not None:
             shutil.rmtree(work_tmpdir, ignore_errors=True)
+
+
+def _run_repo_path(p: argparse.ArgumentParser, ns: argparse.Namespace, binary_args: list[str]) -> None:
+    """Repo-aware multi-file optimization path."""
+    import os
+
+    repo_root: Path = ns.repo
+    if not repo_root.is_dir():
+        display.show_error(f"--repo path is not a directory: {repo_root}")
+        sys.exit(1)
+
+    if ns.source is None:
+        p.error("--repo requires --source (entry point for profiling)")
+    if not ns.source.exists():
+        display.show_error(f"Source file not found: {ns.source}")
+        sys.exit(1)
+    if ns.loops <= 0:
+        p.error("--repo requires --loops > 0")
+
+    if shutil.which("perf") is None:
+        display.show_error(
+            "perf not found on PATH.\n"
+            "  Arch:   sudo pacman -S perf\n"
+            "  Debian: sudo apt install linux-perf"
+        )
+        sys.exit(1)
+
+    lang_spec = _detect_lang(ns)
+    compile_flags = ns.compile_flags or lang_spec.default_flags
+    if ns.compile_flags:
+        _validate_compile_flags(ns.compile_flags)
+    cc = ns.compiler or lang_spec.default_compiler
+    output_dir = ns.output_dir or (ns.source.parent / "optimized")
+
+    if lang_spec.compiled and shutil.which(cc) is None:
+        display.show_error(
+            f"Compiler not found on PATH: {cc}\n"
+            "Install it or specify a different compiler with --compiler."
+        )
+        sys.exit(1)
+
+    display.show_banner(f"{ns.source} [{lang_spec.display_name}] [repo: {repo_root}]")
+
+    # 1. Scan repo for all source files
+    with display.spinner(f"Scanning {repo_root} for {lang_spec.display_name} files..."):
+        all_files = scan_repo(repo_root, lang_spec)
+    display.CONSOLE.print(f"[dim]Found {len(all_files)} source file(s)[/]")
+
+    # 2. Build import headers dict
+    with display.spinner("Reading import headers..."):
+        headers: dict[str, str] = build_repo_context(all_files, repo_root)
+
+    # 3. Build dependency tree via LLM
+    with display.spinner("Building dependency tree (LLM)..."):
+        dep_tree = llm.build_dependency_tree(
+            repo_context=headers,
+            lang=lang_spec,
+            model=ns.model,
+            base_url=ns.base_url,
+            api_key=ns.api_key,
+        )
+
+    display.CONSOLE.print(
+        display.Rule("[bold cyan]Dependency Tree[/]", style="cyan")
+    )
+    display.CONSOLE.print(dep_tree)
+
+    # 4. Build and profile the entry point
+    work_tmpdir = Path(tempfile.mkdtemp(prefix="perf_repo_"))
+    try:
+        if lang_spec.compiled:
+            with display.spinner(f"Compiling {ns.source.name} with {cc}..."):
+                out_bin = work_tmpdir / ns.source.stem
+                compile_result = _compiler.build_source(
+                    ns.source, out_bin, lang_spec, compiler=cc, flags=compile_flags
+                )
+            display.show_compile_result(compile_result)
+            if not compile_result.success:
+                display.show_error("Initial compilation failed — cannot continue.")
+                sys.exit(1)
+            binary = out_bin
+            run_argv = compile_result.run_argv + binary_args
+        else:
+            runtime = shutil.which(lang_spec.runtime) or lang_spec.runtime
+            run_argv = [runtime, str(ns.source)] + binary_args
+            binary = ns.source
+
+        perf_data = work_tmpdir / "initial.data"
+        with display.spinner("Profiling entry point..."):
+            stat_result = runner.run_perf_stat(run_argv, ns.timeout)
+            runner.run_perf_record(run_argv, ns.timeout, perf_data)
+            report_result = runner.run_perf_report(perf_data)
+        metrics = parser.parse_stat(stat_result.stderr)
+        functions = parser.parse_report(report_result.stdout)
+        display.show_metrics_table(metrics, functions)
+
+        # 5. Map hot functions to files by matching DSO/symbol names against file list
+        # Build a relative-name → Path mapping for quick lookup
+        rel_to_path: dict[str, Path] = {}
+        for f in all_files:
+            try:
+                rel_to_path[str(f.relative_to(repo_root))] = f
+            except ValueError:
+                rel_to_path[str(f)] = f
+
+        # Score each file by total overhead of hot functions whose DSO matches
+        file_scores: dict[str, float] = {rel: 0.0 for rel in rel_to_path}
+        for hf in functions:
+            dso_name = Path(hf.dso).stem.lower() if hf.dso else ""
+            sym_lower = hf.symbol.lower()
+            for rel in rel_to_path:
+                stem = Path(rel).stem.lower()
+                if stem and (stem in dso_name or stem in sym_lower):
+                    file_scores[rel] = file_scores.get(rel, 0.0) + hf.overhead_pct
+
+        # Sort: hot files first, then alphabetically for stable order
+        sorted_rels = sorted(
+            rel_to_path.keys(),
+            key=lambda r: (-file_scores.get(r, 0.0), r),
+        )
+
+        display.CONSOLE.print(
+            display.Rule(
+                f"[bold cyan]Starting repo optimization — up to {ns.loops} iteration(s)/file "
+                f"[{lang_spec.display_name}][/]",
+                style="cyan",
+            )
+        )
+
+        if lang_spec.compiled:
+            def _compile_fn(src: Path, out: Path) -> "CompileResult":
+                return _compiler.build_source(
+                    src, out, lang_spec, compiler=cc, flags=compile_flags
+                )
+        else:
+            _runtime = shutil.which(lang_spec.runtime) or lang_spec.runtime
+            def _compile_fn(src: Path, out: Path) -> "CompileResult":
+                return CompileResult(
+                    success=True, output_binary=src,
+                    run_argv=[_runtime, str(src)],
+                    stdout="", stderr="", elapsed_seconds=0.0,
+                )
+
+        # 6. Optimize each file, hottest first
+        for rel in sorted_rels:
+            file_path = rel_to_path[rel]
+            score = file_scores.get(rel, 0.0)
+
+            display.CONSOLE.print(
+                display.Rule(
+                    f"[bold yellow]Optimizing {rel}[/] "
+                    f"[dim](hotness: {score:.1f}%)[/]",
+                    style="yellow",
+                )
+            )
+
+            # Build per-file repo_context: deps (files this file imports) and
+            # dependents (files that import this file). We use a simple heuristic:
+            # scan the headers dict for references to this file's stem.
+            this_stem = Path(rel).stem.lower()
+            per_file_ctx: dict[tuple[str, str], str] = {}
+            for other_rel, other_header in headers.items():
+                if other_rel == rel:
+                    continue
+                other_stem = Path(other_rel).stem.lower()
+                header_lower = other_header.lower()
+                # Does this file import other_rel? Check if other_stem appears in this file's header
+                this_header = headers.get(rel, "")
+                if other_stem and other_stem in this_header.lower():
+                    per_file_ctx[("dep", other_rel)] = other_header
+                # Does other_rel import this file?
+                elif this_stem and this_stem in header_lower:
+                    per_file_ctx[("dependent", other_rel)] = other_header
+
+            _check_fn = _build_check_fn(
+                lang_spec, file_path, run_argv, ns.check_cmd, ns.timeout
+            )
+
+            config = optimizer.OptimizeConfig(
+                source=file_path,
+                lang=lang_spec,
+                initial_run_argv=run_argv,
+                binary=binary,
+                binary_args=binary_args,
+                compiler=cc,
+                compile_flags=compile_flags,
+                max_iterations=ns.loops,
+                timeout=ns.timeout,
+                model=ns.model,
+                base_url=ns.base_url,
+                api_key=ns.api_key,
+                think=not ns.no_think,
+                output_dir=output_dir,
+                initial_metrics=metrics,
+                initial_functions=functions,
+                compile_fn=_compile_fn,
+                repo_context=per_file_ctx,
+                dep_tree=dep_tree,
+                on_iteration_start=display.show_iteration_header,
+                on_llm_start=lambda n, m: display.spinner(
+                    f"Asking LLM for optimization {n}/{m}..."
+                ),
+                on_compile_result=display.show_compile_result,
+                on_profile_start=display.spinner,
+                on_profile_done=display.show_metrics_table,
+                on_llm_response=lambda thinking, response, n: (
+                    display.show_llm_thinking(thinking, n),
+                    display.show_llm_optimization_response(response, n),
+                ),
+                on_iteration_done=display.show_iteration_result,
+                on_source_written=display.show_source_diff,
+                on_user_approval=(
+                    (lambda cur, new: display.prompt_user_approval(cur, new, file_path.name))
+                    if ns.user_approved else None
+                ),
+                on_near_best=display.show_near_theoretical_best,
+                security_fn=(
+                    None if ns.no_security
+                    else _make_security_fn(
+                        lang_spec, cc, compile_flags, ns.timeout,
+                        ns.api_key, ns.base_url, ns.model
+                    )
+                ),
+                on_security_result=display.show_security_report,
+                security_remediation=not ns.no_remediate and not ns.no_security,
+                on_security_remediation=display.show_security_remediation,
+                check_fn=_check_fn,
+                on_check_result=display.show_check_result,
+            )
+
+            history, output_path = optimizer.run_optimize_loop(config)
+            display.show_optimization_summary(history, output_path)
+
+    finally:
+        shutil.rmtree(work_tmpdir, ignore_errors=True)
 
 
 def _run_docker_path(p: argparse.ArgumentParser, ns: argparse.Namespace, binary_args: list[str]) -> None:
